@@ -506,25 +506,36 @@ to exist.)
 ## 6. NPU / GPU memory breakdown (XPU hybrid)
 
 The target: routing through the NPU + GPU adds **no second copy** of the model on top of the one shared buffer.
-Staged committed-memory breakdown of the full hybrid compile (`XPU_MEM_DEBUG=1`, Phi-4, @1K, at the
-`[XPU][MEM]` / `[NPUW][MEM]` / `[CM][MEM]` checkpoints):
+Staged process-committed breakdown of the full hybrid **@8K** (Phi-4): `XPU_MEM_DEBUG=1` at the `[XPU][MEM]` compile
+checkpoints, extended through the first prefill with a `GetProcessMemoryInfo`/`PrivateUsage` probe (`mem_probe.py`).
+The two agree and the steady total (**~20.4 GB**) matches the system-wide HWiNFO commit charge for the run.
 
 | Stage | Committed | Delta | What it is |
 |---|---|---|---|
-| after `read_model` | 636 MB | - | IR graph; `.bin` mmap'd (lazy, not committed) |
-| after relocate weights | 8139 MB | **+7504** | **the one shared copy** (407 segs, 7.31 GB i4+int8; GPU+NPU read it) |
-| after decoder `getPartitioning` | 8202 MB | **+63** | weightless funcalls + `LazyTensor` closures (was ~+7 GB before the 6.3 fix) |
-| after decoder VCL compile | 8231 MB | **+29** | **weightless** main blob + 2 small materialized bank tensors |
-| after lm_head VCL compile | 8738 MB | **+502** | **lm_head INT8 weight baked into its device blob** (the one remaining duplicate) |
-| after GPU prefill compile | 9994 MB | **+1302** | GPU activations + folded consts + KV-write graph buffers |
-| **final** | **9999 MB** | | **~9.8 GB** |
+| after `read_model` | 637 MB | - | IR graph; `.bin` mmap'd (lazy, not committed) |
+| after relocate weights | 8139 MB | **+7502** | **the one shared copy** (407 segs, 7.31 GB i4+int8; GPU+NPU read it) - *fixed, context-independent* |
+| after NPU compile | 8688 MB | **+549** | decoder weightless VCL (~+22) + **lm_head INT8 device blob (~+516)** - *fixed* |
+| after GPU prefill compile | 15597 MB | **+6909** | **KV buffer 1.60 GB** + **GPU prefill static-8192 activation pool ~5.3 GB** |
+| after `create_infer_request` | 17220 MB | **+1623** | NPU generate-request tensors + shared-KV slice binding |
+| after 1st prefill (runtime) | 20324 MB | **+3104** | GPU 8192-token activation buffers, allocated on the first infer |
+| **final (steady)** | **~20.4 GB** | | **~2x the ~9.8 GB @1K** |
+
+**Context scaling.** Weights (7.31 GB) and the lm_head blob (0.5 GB) are **fixed**; the KV cache and the GPU-prefill
+working set **scale with sequence length**, so the footprint grows **~9.8 GB @1K -> ~20.4 GB @8K**: KV 0.22 -> 1.60 GB,
+and GPU-prefill (compile pool + runtime activations) ~1.3 -> ~8.4 GB. There is **no weight duplication** - the 7.31 GB
+is one shared copy (Appendix C); the growth is KV + activations, not a second model. A **transient** ~5 GB extra
+appears *only during* weight relocation - the source `.bin` faulted resident alongside the shared buffer, visible as
+`Physical Used > Committed` in a system trace - and is released before inference (so it raises the load-time peak,
+not the steady footprint). Note the "GPU D3D Memory Dynamic" counter (~18.8 GB in a system trace) **double-counts**
+the imported shared weights + KV, so it over-reads the GPU's true working set.
 
 ### 6.1 What is shared (one copy, GPU + NPU)
 - **Weights: 7.31 GB** (407 segments). One host malloc per weight, imported into both L0 contexts (1.1); GPU reads
   via `share_usm`, NPU reads natively. No private device weight copy on either side (proof: Appendix C).
-- **KV cache: 224.8 MB** (80 slots, `[1,10,1151,128]` f16 key + transposed value). A **HOST-imported malloc**
-  (`type=HOST`, `base==ptr` in the GPU L0 ctx - verified), **not** `usm_device`; the NPU imports the same buffer.
-  GPU writes it in place during prefill, NPU reads/writes it in place during decode.
+- **KV cache: 1.60 GB @8K** (80 slots, `[1,10,8320,128]` f16 key + transposed value; `total_size`=8320 -> 1,703,731,200 B).
+  Scales with `total_size` (was 224.8 MB @1K, `[1,10,1151,128]`). A **HOST-imported malloc** (`type=HOST`,
+  `base==ptr` in the GPU L0 ctx - verified), **not** `usm_device`; the NPU imports the same buffer. GPU writes it in
+  place during prefill, NPU reads/writes it in place during decode.
 
 ### 6.2 NPU-specific overhead (~595 MB)
 | Cost | Phi-4 | Avoidable? |
@@ -558,15 +569,23 @@ shared-buffer `Constant`s but dropped the `WeightlessCacheAttribute` (its `is_co
 new Constant not in the weights file" and **eagerly copies it to host**. Preserving the attribute with
 **`ov::copy_weightless_cache_attr`** (`plugin.cpp`, right after relocation) drops `getPartitioning` to **+63 MB**,
 with the bank behavior unchanged (`[DIAG] raw_views=404 materialized=2`) and output token-exact. On Qwen3-4B the
-same fix took the final footprint from 6.0 -> 3.9 GB (-35%); on Phi-4 it is the difference between ~17 GB and the
-measured ~9.8 GB.
+same fix took the final footprint from 6.0 -> 3.9 GB (-35%); on Phi-4 it is the difference between ~17 GB and
+~9.8 GB @1K - and it takes the same ~7 GB off the @8K total (the decoder weights it de-duplicates are
+context-independent), so without it the @8K run would be ~27 GB instead of ~20 GB.
 
-### 6.4 GPU-specific overhead (~1.3 GB at compile)
-The GPU prefill compile adds **+1302 MB** committed: the prefill activations (1024 tokens x hidden 5120 x layers),
-folded constants, and the **KV-write graph buffers** - the static `present.*` outputs (~225 MB, = the KV size) and
-the `ScatterUpdate`/`Broadcast(0)` zeros. The 7.31 GB weights are the **imported malloc** (external), so they do
-**not** count as GPU-allocated memory; the GPU's own stats show only this scratch. No weight copy (a copy would
-add +7.3 GB of GPU `usm_device` - measured ~0 for weights).
+### 6.4 GPU-specific overhead (~8.4 GB @8K: ~5.3 GB compile pool + ~3.1 GB runtime)
+The GPU prefill is the dominant **variable** cost and scales steeply with sequence length (**~1.3 GB @1K -> ~8.4 GB @8K**):
+- **~5.3 GB at `compile_model`** - the GPU plugin **pre-reserves the intermediate-activation memory pool** for the
+  *static* 8192-token prefill graph (hidden `[1,8192,5120]` and MLP `[1,8192,17920]` f16 tensors x layers, folded
+  consts, the `ScatterUpdate`/`Broadcast(0)` KV-write buffers). This is *pool reservation*, not kernel-building - so
+  "compile" genuinely commits ~5.3 GB even though building the kernels is cheap.
+- **~3.1 GB on the first prefill infer** - additional activation buffers the driver allocates when the 8192-token
+  graph actually executes.
+
+The 7.31 GB weights are the **imported malloc** (external, read in place via `OV_XPU_REF_COMPRESSED_FC` - no reorder,
+no dequant copy), so they are **not** a GPU-allocated copy (a copy would add +7.3 GB of GPU `usm_device` - measured
+~0 for weights). To shrink the ~8.4 GB, **chunked prefill** would bound the activation pool to a chunk size instead
+of the full static 8192-token shape.
 
 ## 7. Configuration
 

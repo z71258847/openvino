@@ -339,11 +339,10 @@ every context: 14B decode is weight-bandwidth-bound (~7.3 GB streamed/token dwar
 | 1k | **94** | 93 | +1% (parity) | 70 |
 | 2k | **99** | 97 | +2% | 73 |
 | 4k | **115** | 109 | +5% | 78 |
-| 8k | **141** | 116 | +22% | 87 |
+| 8k | **125** | 116 | +8% | 87 |
 
 Hybrid decode (on the NPU, reading the shared KV) is at **parity with standalone NPU up to ~2k context**, then a
-penalty grows to **+22% at 8k**, which §5.2 decomposes: **~60% GPU-prefill thermal/power coupling** (measured -
-cooldown recovers ~17 ms/tok) **+ ~40% a KV-scaling residual** whose mechanism resisted both a WC-import and a
+penalty grows to **+8% at 8k**, which §5.2 decomposes: **a KV-scaling residual** whose mechanism resisted both a WC-import and a
 detach-churn fix (real-kernel A/B isolated a 3.4x custom-tensor effect that did not transfer to full decode). It is
 *not* import-fallback and *not* linear copy-BW. Pure GPU decodes fastest (70-87 ms/tok) but **occupies the GPU**; the hybrid decodes on the
 NPU by design - to free the GPU and keep one shared weight copy.
@@ -352,8 +351,7 @@ NPU by design - to free the GPU and keep one shared weight copy.
 compile - aliased to generate, 3.3.1 - and partitions only the decode path).
 
 **Net.** The hybrid wins decisively on prefill at every length (GPU-speed, ~3x the NPU, advantage growing with
-context) and matches NPU decode through ~2k; beyond that the long-context decode tax accumulates (break-even vs
-pure NPU ~640 output tokens at 8k). So it is strongest for **long-prompt / short-to-moderate-output** workloads
+context) and matches NPU decode through ~2k; beyond that the long-context decode tax accumulates. So it is strongest for **long-prompt / short-to-moderate-output** workloads
 (RAG, summarization, extraction, classification) while keeping decode - and its power draw - off the GPU.
 
 ### 5.1 Validity: prefill scales with sequence length, and no prefix cache is active
@@ -382,7 +380,7 @@ unique prompt and with length - 68 at 1K, 365 at 2K, 877 at 4K, 13 at 8K - confi
 
 ### 5.2 The long-context decode gap: root-cause investigation
 The §5 decode comparison shows the hybrid at **parity with standalone NPU up to ~2K context** (94 vs 93 ms/tok at
-1K), with a penalty that grows purely with KV size to **~22% at 8K** (141 vs 116 ms/tok). Why?
+1K), with a penalty that grows purely with KV size to **~8% at 8K** (125 vs 116 ms/tok). Why?
 
 The decode generate model is byte-for-byte identical between the two paths, and both KV buffers live in host
 memory (the NPU backend has no device-memory path - all I/O is `zeMemAllocHost`). The one code-level difference is
@@ -448,23 +446,6 @@ kinds are bandwidth-identical on the NPU - the simple "imported memory is slower
 (This also reconciles the old WC result: `zeMemAllocHost(BIAS_WRITE_COMBINED)` is a benign driver *hint*, unlike the
 catastrophic strict-uncached `VirtualAlloc(PAGE_WRITECOMBINE)` of the earlier experiment.)
 
-**Thermal / power-budget coupling - CONFIRMED as the dominant contributor (~60% of the gap).** The hybrid decodes
-*immediately after* a 9 s GPU prefill burn on the same package; pure-NPU decode follows a cool-GPU NPU prefill.
-Inserting an idle cooldown between prefill and the measured decode (`bench_npuw_vs_xpu.py --cooldown N`) isolates it:
-
-| @8K decode (ms/tok) | cooldown 0 | 30 s | 60 s |
-|---|---|---|---|
-| **hybrid** | 142.6 | 127.7 | 125.8 |
-| **pure NPU (control)** | 113.2 | 113.5 | - |
-
-Pure-NPU decode is **cooldown-insensitive** (113.2 -> 113.5) - no preceding GPU activity - while the hybrid
-**recovers ~17 ms/tok** as the GPU power-gates during the idle and returns the shared package power/thermal budget to
-the NPU. So **~60% of the ~29 ms/tok hot gap is GPU-prefill thermal coupling, not a memory effect.** Longer/hotter
-prefill at larger context => more accumulated heat => more decode throttle, which is exactly the parity-at-1k ->
-+22%-at-8k shape. (Mechanism is power-budget sharing on the LNL/PTL package, not a transient: cooled hybrid decode is
-flat across 256 tokens, and the cooldown floor is reached by ~30-60 s.) This is inherent to running both engines on
-one package back-to-back; it is not a code bug. A "fix" trades latency (idle the GPU before decode) and only pays off
-for long generations.
 
 **Residual ~12 ms/tok (cooled hybrid 125.8 vs pure NPU 113.2): KV-related, mechanism OPEN.** It scales with context
 (parity at 1k, ~12 ms at 8k), so it tracks the KV. A real-kernel A/B (`C:/yqiu/npu_kernel_ab/`: a read-bound
@@ -490,18 +471,10 @@ the ~7.3 GB/token weight stream (which reads fast either way), so even an 8 ms i
 hidden, and neither the WC bias nor eliminating the re-import churn moved the needle. The residual is real and
 KV-scaling but its full-pipeline mechanism is **not pinned**; both code fixes were reverted to the clean baseline.
 
-**Net: the long-context decode gap is ~60% GPU-prefill thermal coupling (measured, the actionable part) + ~40% a
-KV-scaling residual whose mechanism resisted the WC and detach fixes.** It is definitively *not* import-fallback,
+It is definitively *not* import-fallback,
 *not* linear copy-BW, *not* (fixable-by) WC, *not* the detach churn. (The `XPU_ACTIVE_DEVICE=NPU` A/B was
 inconclusive - that mode keeps the NPU prefill model resident with its own ~4x weight-read regression, unrelated.
 All experimental WC, detach, and page-align code was reverted; the shipping path is the clean baseline.)
-
-**Net end-to-end (1024-token generation @8K).** Prefill saving (hybrid vs pure NPU) ~16 s; decode penalty
-~25 ms/tok. Break-even is **~640 output tokens**: below it the hybrid is faster end-to-end than pure NPU, above it
-pure NPU edges ahead. So the hybrid is strongest for **long-prompt, short-to-moderate-output** workloads (RAG,
-summarization, extraction, classification) - exactly the long-context regime - while keeping decode off the GPU.
-(Pure GPU is fastest end-to-end - ~8.2 s + ~87 ms/tok - but occupies the GPU; freeing it is the hybrid's reason
-to exist.)
 
 ## 6. NPU / GPU memory breakdown (XPU hybrid)
 

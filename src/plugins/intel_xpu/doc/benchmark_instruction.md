@@ -88,15 +88,15 @@ Configure and build (Release). These flags match the validated build:
 ```bat
 :: from an "x64 Native Tools Command Prompt for VS 2022", or after calling vcvars64.bat
 cd C:\ov\openvino
-cmake -B build -G "Visual Studio 17 2022" -A x64 ^
-  -DCMAKE_BUILD_TYPE=Release ^
-  -DENABLE_INTEL_GPU=ON ^
-  -DENABLE_INTEL_NPU=ON ^
-  -DENABLE_INTEL_CPU=ON ^
-  -DENABLE_PYTHON=ON ^
-  -DENABLE_WHEEL=OFF ^
-  -DENABLE_SAMPLES=OFF
-cmake --build build --config Release -j
+cmake -B build -G "Visual Studio 17 2022" \
+      -D CMAKE_BUILD_TYPE=Release \
+      -D ENABLE_INTEL_GPU=ON  -D GPU_RT_TYPE=L0 \
+      -D ENABLE_INTEL_NPU=ON \
+      -D ENABLE_INTEL_CPU=ON \
+      -D ENABLE_ONEDNN_FOR_GPU=ON \
+      -D ENABLE_PYTHON=ON  -D Python3_EXECUTABLE=<path-to-python> \
+      -D THREADING=TBB_ADAPTIVE
+cmake --build build --config Release --parallel
 ```
 
 **Verify the XPU plugin was produced and registered:**
